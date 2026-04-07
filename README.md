@@ -107,7 +107,7 @@ emotionRecognitionPPG/
 
 ![License](https://img.shields.io/badge/License-Educational-blue?style=flat-square)
 
-This project is for **educational purposes** (CSC591 007 - Project).
+This project is for **educational purposes** (CSC591 012 - Project).
 
 ---
 

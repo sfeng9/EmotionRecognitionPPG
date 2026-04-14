@@ -2,3 +2,9 @@ node_modules/
 packages/
 repomix-output.xml
 data/WESAD
+src/WESAD/
+.DS_Store
+__pycache__/
+*.pyc
+*.pkl
+*.zip

@@ -7,7 +7,7 @@ from src.data_loader import (
     apply_bandpass, BVP_FS, LABEL_NAMES, WINDOW_SAMPLES
 )
 from src.feature_extraction import extract_all_features, FEATURE_NAMES, N_FEATURES
-from src.models import train_svm, train_random_forest, train_cnn, loso_cv, print_comparison
+from src.models import train_svm, train_random_forest, train_cnn, train_lstm, loso_cv, print_comparison
 
 WESAD_DIR = "src/WESAD"
 
@@ -149,8 +149,29 @@ def run_cnn():
 
     print(f"Train: {X_train.shape}, Test: {X_test.shape}")
     cnn_metrics, _ = train_cnn(X_train, y_train, X_test, y_test,
-                                epochs=50, batch_size=32, lr=1e-3)
+                                epochs=60, batch_size=32, lr=1e-3)
     return cnn_metrics
+
+
+def run_lstm():
+    """
+    CNN-LSTM hybrid pipeline — same subject split as CNN for a fair comparison.
+    A small CNN encodes each 1-second chunk into a 64-dim feature vector;
+    the LSTM then models how those features evolve over the 60-second window.
+    """
+    print("\n── CNN-LSTM hybrid ───────────────────────────────────────────────")
+
+    subjects, X_list, y_list = load_all_subjects(WESAD_DIR)
+
+    TEST_SUBJECTS = ["S2", "S3", "S4"]
+    X_train, y_train, X_test, y_test = split_by_subject(
+        subjects, X_list, y_list, test_subjects=TEST_SUBJECTS
+    )
+
+    print(f"Train: {X_train.shape}, Test: {X_test.shape}")
+    lstm_metrics, _ = train_lstm(X_train, y_train, X_test, y_test,
+                                  epochs=60, batch_size=32, lr=5e-4)
+    return lstm_metrics
 
 
 def run_loso():
@@ -171,12 +192,13 @@ if __name__ == "__main__":
     test_all_subjects()
     test_feature_extraction()
 
-    # Fixed split: SVM + RF + CNN
+    # Fixed split: SVM + RF + CNN + LSTM
     feature_results = run_feature_based_models()
     cnn_metrics     = run_cnn()
+    lstm_metrics    = run_lstm()
 
     # LOSO cross-validation: SVM + RF
     loso_results = run_loso()
 
     # Final comparison across all models
-    print_comparison(feature_results + [cnn_metrics] + loso_results)
+    print_comparison(feature_results + [cnn_metrics, lstm_metrics] + loso_results)

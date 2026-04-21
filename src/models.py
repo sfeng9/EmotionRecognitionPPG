@@ -13,7 +13,7 @@ from sklearn.metrics import (
     accuracy_score, f1_score, confusion_matrix, classification_report
 )
 
-from src.data_loader import LABEL_NAMES
+from src.data_loader import LABEL_NAMES, N_CLASSES
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _scale(X_train: np.ndarray, X_test: np.ndarray):
@@ -48,7 +48,7 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray, model_name: str):
     print()
     print(classification_report(
         y_true, y_pred,
-        target_names=[LABEL_NAMES[i] for i in range(4)],
+        target_names=[LABEL_NAMES[i] for i in range(N_CLASSES)],
         digits=3
     ))
 
@@ -61,7 +61,7 @@ def plot_confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray,
     Plot and optionally save a normalised confusion matrix.
     """
     cm = confusion_matrix(y_true, y_pred, normalize="true")
-    labels = [LABEL_NAMES[i] for i in range(4)]
+    labels = [LABEL_NAMES[i] for i in range(N_CLASSES)]
 
     fig, ax = plt.subplots(figsize=(6, 5))
     sns.heatmap(
@@ -318,11 +318,14 @@ def train_cnn(X_train: np.ndarray, y_train: np.ndarray,
     test_loader  = DataLoader(PPGDataset(X_test,  y_test),
                               batch_size=batch_size, shuffle=False)
 
-    model = CNN1D(n_classes=4).to(device)
+    model = CNN1D(n_classes=N_CLASSES).to(device)
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, patience=5, factor=0.5
+    # CosineAnnealingLR decays LR smoothly to eta_min over all epochs,
+    # avoiding the abrupt drops of ReduceLROnPlateau and letting the model
+    # explore a wider loss landscape early then converge tightly at the end.
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=1e-5
     )
 
     # Training loop
@@ -340,7 +343,7 @@ def train_cnn(X_train: np.ndarray, y_train: np.ndarray,
 
         epoch_loss /= len(y_train)
         train_losses.append(epoch_loss)
-        scheduler.step(epoch_loss)
+        scheduler.step()
 
         if epoch % 10 == 0:
             print(f"  Epoch {epoch:3d}/{epochs}  loss: {epoch_loss:.4f}")
@@ -357,21 +360,178 @@ def train_cnn(X_train: np.ndarray, y_train: np.ndarray,
     metrics = evaluate(y_test, y_pred, "1D CNN (end-to-end)")
     plot_confusion_matrix(y_test, y_pred, "1D CNN",
                           save_path="confusion_matrix_cnn.png")
-    _plot_training_loss(train_losses)
+    _plot_training_loss_named(train_losses, "1D CNN", "cnn_training_loss.png")
 
     return metrics, model
 
 
-def _plot_training_loss(losses: list):
+# ── CNN-LSTM hybrid ───────────────────────────────────────────────────────────
+class CNNLSTMClassifier(nn.Module):
+    """
+    CNN-LSTM hybrid emotion classifier for PPG windows.
+
+    Architecture
+    ─────────────────────────────────────────────────────────
+    Input  : (batch, 3840)   — raw filtered, z-normalised PPG window
+
+    Reshape: (batch, 60, 64) — treat the window as a sequence of 60
+             one-second chunks (64 samples each @ 64 Hz).
+
+    Per-chunk CNN encoder (applied identically to each of the 60 chunks):
+      Conv1d(1→32, k=5, pad=2) → BN → ReLU → MaxPool(2) → (32, 32)
+      Conv1d(32→64, k=3, pad=1) → BN → ReLU → AdaptiveAvgPool → (64,)
+    This replaces 64 raw samples with a 64-dim cardiac feature vector.
+
+    LSTM(64→128, 2 layers, dropout=0.3):
+      Sees a sequence of 60 meaningful cardiac feature vectors and models
+      how the cardiac signal evolves over the 60-second window (e.g., HR
+      drift during stress, HRV changes during amusement).
+
+    Last hidden state: (batch, 128)
+    FC(128→64) → ReLU → Dropout(0.5)
+    FC(64→N_CLASSES) → logits
+    ─────────────────────────────────────────────────────────
+
+    Why hybrid beats pure LSTM:
+    The pure LSTM received 64 raw PPG samples per timestep — noisy,
+    unstructured input that forces the LSTM to simultaneously learn local
+    waveform features AND long-range temporal patterns.  The CNN encoder
+    handles local waveform feature extraction, leaving the LSTM free to
+    focus on temporal dynamics across the full 60-second window.
+
+    This mirrors the architecture described in the course reference:
+    "Feature Augmented Hybrid CNN for Stress Recognition Using
+     Wrist-based Photoplethysmography Sensor."
+    """
+    def __init__(self, n_classes: int = 4,
+                 hidden_size: int = 128, num_layers: int = 2):
+        super().__init__()
+        self.seq_len    = 60  # one-second chunks
+        self.chunk_size = 64  # samples per chunk (= BVP_FS)
+
+        # Small CNN applied to every 1-second chunk independently
+        self.chunk_encoder = nn.Sequential(
+            nn.Conv1d(1, 32, kernel_size=5, padding=2),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.MaxPool1d(2),                          # (32, 32)
+            nn.Conv1d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1),                  # (64, 1)
+        )
+
+        self.lstm = nn.LSTM(
+            input_size=64,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=0.3,
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_size, 64),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(64, n_classes),
+        )
+
+    def forward(self, x):
+        # x: (batch, 3840)
+        B = x.size(0)
+        # Split into 60 one-second chunks → (batch*60, 1, 64)
+        chunks = x.view(B * self.seq_len, 1, self.chunk_size)
+        # Encode each chunk → (batch*60, 64)
+        enc = self.chunk_encoder(chunks).squeeze(-1)
+        # Reshape back to sequence → (batch, 60, 64)
+        enc = enc.view(B, self.seq_len, 64)
+        # LSTM over the sequence
+        _, (h_n, _) = self.lstm(enc)
+        out = h_n[-1]                  # last layer hidden state: (batch, 128)
+        return self.classifier(out)
+
+
+def train_lstm(X_train: np.ndarray, y_train: np.ndarray,
+               X_test:  np.ndarray, y_test:  np.ndarray,
+               epochs: int = 60, batch_size: int = 32, lr: float = 5e-4):
+    """
+    Train the LSTM classifier on raw PPG windows.
+
+    Key training decisions (same rationale as CNN except where noted):
+    - lr=5e-4: LSTMs often need a slightly lower LR than CNNs to avoid
+      exploding gradients through the recurrent connections.
+    - CosineAnnealingLR: smoothly decays LR to near-zero over training,
+      helping the model settle into a better minimum than step decay.
+    - gradient clipping (max_norm=1.0): standard practice for RNNs to
+      prevent gradient explosion.
+
+    Args / Returns: same signature as train_cnn.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"  Training on: {device}")
+
+    classes, counts = np.unique(y_train, return_counts=True)
+    weights = 1.0 / counts
+    weights = weights / weights.sum() * len(classes)
+    class_weights = torch.tensor(weights, dtype=torch.float32).to(device)
+
+    train_loader = DataLoader(PPGDataset(X_train, y_train, augment=True),
+                              batch_size=batch_size, shuffle=True)
+    test_loader  = DataLoader(PPGDataset(X_test,  y_test),
+                              batch_size=batch_size, shuffle=False)
+
+    model     = CNNLSTMClassifier(n_classes=N_CLASSES).to(device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=1e-5
+    )
+
+    train_losses = []
+    for epoch in range(1, epochs + 1):
+        model.train()
+        epoch_loss = 0.0
+        for X_batch, y_batch in train_loader:
+            X_batch, y_batch = X_batch.squeeze(1).to(device), y_batch.to(device)
+            optimizer.zero_grad()
+            loss = criterion(model(X_batch), y_batch)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            epoch_loss += loss.item() * len(y_batch)
+
+        epoch_loss /= len(y_train)
+        train_losses.append(epoch_loss)
+        scheduler.step()
+
+        if epoch % 10 == 0:
+            print(f"  Epoch {epoch:3d}/{epochs}  loss: {epoch_loss:.4f}")
+
+    model.eval()
+    all_preds = []
+    with torch.no_grad():
+        for X_batch, _ in test_loader:
+            preds = model(X_batch.squeeze(1).to(device)).argmax(dim=1).cpu().numpy()
+            all_preds.extend(preds)
+
+    y_pred = np.array(all_preds)
+    metrics = evaluate(y_test, y_pred, "CNN-LSTM (hybrid)")
+    plot_confusion_matrix(y_test, y_pred, "CNN-LSTM",
+                          save_path="confusion_matrix_cnn_lstm.png")
+    _plot_training_loss_named(train_losses, "CNN-LSTM", "cnn_lstm_training_loss.png")
+
+    return metrics, model
+
+
+def _plot_training_loss_named(losses: list, name: str, path: str):
     _, ax = plt.subplots(figsize=(7, 3))
-    ax.plot(range(1, len(losses) + 1), losses, color="tomato", linewidth=1.2)
-    ax.set_title("1D CNN — Training Loss")
+    ax.plot(range(1, len(losses) + 1), losses, color="mediumseagreen", linewidth=1.2)
+    ax.set_title(f"{name} — Training Loss")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Cross-entropy loss")
     plt.tight_layout()
-    plt.savefig("cnn_training_loss.png", dpi=150)
+    plt.savefig(path, dpi=150)
     plt.close()
-    print("  Training loss plot saved to cnn_training_loss.png")
+    print(f"  Training loss plot saved to {path}")
 
 
 # ── Comparison summary ────────────────────────────────────────────────────────

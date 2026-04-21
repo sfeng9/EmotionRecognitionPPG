@@ -12,8 +12,20 @@ STEP_SEC = 30        # step between windows in seconds
 WINDOW_SAMPLES = WINDOW_SEC * BVP_FS   # 3840
 STEP_SAMPLES = STEP_SEC * BVP_FS       # 1920
 
-LABEL_MAP = {1: 0, 2: 1, 3: 2, 4: 3}  # baseline, stress, amusement, meditation
-LABEL_NAMES = {0: "baseline", 1: "stress", 2: "amusement", 3: "meditation"}
+# 4-class maps (includes meditation)
+LABEL_MAP_4  = {1: 0, 2: 1, 3: 2, 4: 3}
+LABEL_NAMES_4 = {0: "baseline", 1: "stress", 2: "amusement", 3: "meditation"}
+
+# 3-class maps (baseline / stress / amusement — meditation excluded)
+# Meditation is physiologically similar to baseline in wrist PPG (low HR,
+# high HRV) and is the primary source of inter-class confusion.
+LABEL_MAP_3  = {1: 0, 2: 1, 3: 2}
+LABEL_NAMES_3 = {0: "baseline", 1: "stress", 2: "amusement"}
+
+# Active configuration — change N_CLASSES to switch modes
+N_CLASSES   = 4
+LABEL_MAP   = LABEL_MAP_3   if N_CLASSES == 3 else LABEL_MAP_4
+LABEL_NAMES = LABEL_NAMES_3 if N_CLASSES == 3 else LABEL_NAMES_4
 
 # Minimum fraction of a window that must share the majority label.
 # Windows below this threshold span a condition boundary and are discarded.
@@ -153,6 +165,16 @@ def load_subject(pkl_path: str):
 
     # Filter
     bvp_filtered = apply_bandpass(bvp_raw)
+
+    # Per-subject z-score normalization.
+    # PPG amplitude varies widely across subjects (skin tone, sensor fit,
+    # contact pressure).  Normalising the full filtered signal to zero mean
+    # and unit variance before windowing makes sure the CNN and LSTM see a
+    # consistent amplitude range and helps the SVM / RF feature values
+    # (peak amplitudes, mean) be comparable across subjects.
+    std = bvp_filtered.std()
+    if std > 0:
+        bvp_filtered = (bvp_filtered - bvp_filtered.mean()) / std
 
     # Segment
     windows, y = _segment(bvp_filtered, labels_aligned)

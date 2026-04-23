@@ -476,7 +476,8 @@ def train_lstm(X_train: np.ndarray, y_train: np.ndarray,
     print(f"  Training on: {device}")
 
     classes, counts = np.unique(y_train, return_counts=True)
-    weights = 1.0 / counts
+    # Use puishment weights (sqrt of counts)
+    weights = 1.0 / np.sqrt(counts)
     weights = weights / weights.sum() * len(classes)
     class_weights = torch.tensor(weights, dtype=torch.float32).to(device)
 

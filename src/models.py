@@ -1,7 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-
+from imblearn.over_sampling import SMOTE
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -101,14 +101,20 @@ def train_svm(X_train: np.ndarray, y_train: np.ndarray,
     """
     X_train_s, X_test_s, scaler = _scale(X_train, X_test)
 
+    # Apply SMOTE to train data
+    smote = SMOTE(random_state=42)
+    X_train_reshaped, y_train_reshaped = smote.fit_resample(X_train_s, y_train)
+
+    print(f"  Before SMOTE: {np.bincount(y_train)}")
+    print(f"  After SMOTE:  {np.bincount(y_train_reshaped)}")
+    
     model = SVC(
         kernel="rbf",
         C=10,
         gamma="scale",
         class_weight="balanced",
-        random_state=42,
     )
-    model.fit(X_train_s, y_train)
+    model.fit(X_train_reshaped, y_train_reshaped)
     y_pred = model.predict(X_test_s)
 
     metrics = evaluate(y_test, y_pred, "SVM (RBF kernel)")

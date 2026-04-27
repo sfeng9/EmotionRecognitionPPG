@@ -23,6 +23,7 @@
 - [Usage](#-usage)
 - [Results](#-results)
 - [Project Structure](#-project-structure)
+- [Project Report](#-project-report)
 ---
 
 ## 🎯 About
@@ -140,7 +141,7 @@ emotionRecognitionPPG/
 ---
 
 ## 📝 Project Report
-[View Full Report (PDF)](./docs/EmotionRecognitionReport.pdf)
+[View Full Report (PDF)](./src/docs/EmotionRecognitionReport.pdf)
 
 
 ---

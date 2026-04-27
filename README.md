@@ -139,7 +139,8 @@ emotionRecognitionPPG/
 
 ---
 
-## 📝 Notes
+## 📝 Project Report
+[View Full Report (PDF)](./docs/EmotionRecognitionReport.pdf)
 
 
 ---
